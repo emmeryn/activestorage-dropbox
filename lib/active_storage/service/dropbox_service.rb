@@ -5,6 +5,11 @@ require "dropbox_api"
 module ActiveStorage
   # Wraps the Dropbox Storage as an Active Storage service. See ActiveStorage::Service for the generic API
   # documentation that applies to all services.
+  #
+  # Dropbox does not support setting file download name via Content-Disposition, see:
+  # https://www.dropboxforum.com/t5/Discuss-Developer-API/Content-Disposition-in-dropbox/td-p/340864
+  # Until they do, we create a new folder for each file, where folder name is the key while
+  # filename is untouched.
   class Service::DropboxService < Service
     def initialize(**config)
       @config = config
@@ -12,7 +17,7 @@ module ActiveStorage
 
     def upload(key, io, checksum: nil, content_type: nil, disposition: nil, filename: nil)
       instrument :upload, key: key, checksum: checksum do
-        client.upload_by_chunks "/"+key, io
+        client.upload_by_chunks "/#{key}/#{filename}", io
       rescue DropboxApi::Errors::UploadError
         raise ActiveStorage::IntegrityError
       end
@@ -34,6 +39,7 @@ module ActiveStorage
 
     def delete(key)
       instrument :delete, key: key do
+        # Contents of folder deleted if path is a folder
         client.delete("/"+key)
       rescue DropboxApi::Errors::NotFoundError
         # Ignore files already deleted
@@ -51,7 +57,10 @@ module ActiveStorage
     def exist?(key)
       instrument :exist, key: key do |payload|
         begin
-          answer = client.get_metadata("/"+key).present?
+          list_folder_result = client.list_folder(key, { limit: 1 })
+          filename = list_folder_result.entries.first.name
+
+          answer = client.get_metadata("/#{key}/#{filename}").present?
         rescue DropboxApi::Errors::NotFoundError
           answer = false
         end
@@ -73,11 +82,17 @@ module ActiveStorage
       attr_reader :config
 
       def file_for(key)
-        client.get_temporary_link("/"+key)
+        list_folder_result = client.list_folder("/#{key}", { limit: 1 })
+        filename = list_folder_result.entries.first.name
+
+        client.get_temporary_link("/#{key}/#{filename}")
       end
 
       def download_for(key)
-        client.download("/"+key) do |chunk|
+        list_folder_result = client.list_folder("/#{key}", { limit: 1 })
+        filename = list_folder_result.entries.first.name
+
+        client.download("/#{key}/#{filename}") do |chunk|
           return chunk.force_encoding(Encoding::BINARY)
         end
       end
@@ -85,7 +100,10 @@ module ActiveStorage
       # Reads the file for the given key in chunks, yielding each to the block.
       def stream(key)
         begin
-          file = client.download("/"+key) do |chunk|
+          list_folder_result = client.list_folder("/#{key}", { limit: 1 })
+          filename = list_folder_result.entries.first.name
+
+          file = client.download("/#{key}/#{filename}") do |chunk|
             yield chunk
           end
         rescue DropboxApi::Errors::NotFoundError
